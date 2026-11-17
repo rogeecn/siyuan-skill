@@ -124,6 +124,8 @@ mcp <tool> | import | call <endpoint>
 - [`references/siyuan-operations.md`](references/siyuan-operations.md)：任务导向配方（建文档、移动、属性、日记、模板、数据库、搜索、快照、导出）。
 - [`references/siyuan-api.md`](references/siyuan-api.md)：端点目录、块类型、SQLite schema、上传/移动/快照的契约与坑、
   `call` 白名单、`/mcp` 桥与 HTTP 缺口。
+- [`references/note-practice.md`](references/note-practice.md)：**最佳笔记实践**——案例（卢曼卡片盒、常青笔记、PARA、
+  思源写作流、渐进式总结）+ 四层架构 + 原子卡规范 + 维护体检 SQL + 反模式 + 30 天计划。
 - [`references/limitations.md`](references/limitations.md)：**能力边界与限制**（硬限制、坑与对策、场景可行性速判、
   反模式清单、部署检查表、与 MCP 的分工）。
 

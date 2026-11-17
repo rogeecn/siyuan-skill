@@ -1482,8 +1482,17 @@ def cmd_template(args):
         guard.any_perm("R")
         if args.id:
             guard.by_block(args.id, ["R"])
-        text = _escape_go_template(client.read_workspace_file(rel))
-        print_json(client.render_sprig(text))
+        text = client.read_workspace_file(rel)
+        if getattr(args, "escape", False):
+            text = _escape_go_template(text)
+        try:
+            print_json(client.render_sprig(text))
+        except SiYuanError as exc:
+            if "not defined" not in str(exc):
+                raise
+            # 模板里含 SiYuan 语法（如 {{SELECT ...}}），不是 Go action：按字面渲染
+            sys.stderr.write("模板含非 Go 语法的 {{ }}，已按字面渲染；确认无误可加 --escape\n")
+            print_json(client.render_sprig(_escape_go_template(text)))
     elif args.action == "save-as":
         guard.by_block(args.id, ["W"])
         print_json(
@@ -2078,6 +2087,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr = tsub.add_parser("render", parents=[common])
     tr.add_argument("path")
     tr.add_argument("--id", default="", help="渲染上下文的块 id")
+    tr.add_argument("--escape", action="store_true", help="把 {{ }} 当字面文本转义（不参与 Go 模板求值）")
     tr.set_defaults(func=cmd_template, action="render")
     tsa = tsub.add_parser("save-as", help="文档存为模板（W）", parents=[common])
     tsa.add_argument("id")
