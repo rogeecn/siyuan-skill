@@ -93,7 +93,7 @@ class Connection:
         self.token = token.strip()
         self.timeout = float(os.environ.get("SIYUAN_TIMEOUT", "120") or 120)
 
-    def validate(self) -> "Connection":
+    def validate(self) -> Connection:
         if not self.url:
             raise SiYuanError(
                 "缺少环境变量 SIYUAN_API_URL（实例地址）。\n"
@@ -428,6 +428,86 @@ class Client:
     def set_block_attrs(self, block_id: str, attrs: dict):
         return self.call("/api/attr/setBlockAttrs", {"id": block_id, "attrs": attrs})
 
+    # -- MCP 桥（内核进程内能力，HTTP API 未开放的少量操作）--
+
+    def _mcp_post(self, payload: dict, session: str = "") -> tuple[str, str]:
+        """MCP 走 Streamable HTTP：会话 id 在响应头 Mcp-Session-Id，必须自己读头。"""
+        headers = {
+            "Authorization": f"Token {self.conn.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if session:
+            headers["Mcp-Session-Id"] = session
+        req = urllib.request.Request(
+            self.conn.url + "/mcp", data=json.dumps(payload).encode("utf-8"), headers=headers
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.conn.timeout) as resp:
+                session = resp.headers.get("Mcp-Session-Id") or session
+                text = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise SiYuanError("SiYuan 认证失败（401）：检查 SIYUAN_TOKEN") from e
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            raise SiYuanError(f"HTTP {e.code} POST /mcp: {detail or e.reason}") from e
+        except urllib.error.URLError as e:
+            raise SiYuanError(f"连接 SiYuan 失败（{self.conn.url}）: {e.reason}") from e
+        if text.lstrip().startswith(("event:", "data:")):
+            parts = [
+                line[5:].strip() for line in text.splitlines() if line.startswith("data:")
+            ]
+            text = parts[-1] if parts else ""
+        return session, text
+
+    def mcp_call(self, name: str, arguments: dict):
+        """调内核内置 MCP 工具；只需一次 initialize 握手（每次进程一次）。"""
+        session, _ = self._mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "siyuan-skill", "version": "1.2.0"},
+                },
+            }
+        )
+        # 响应的 Mcp-Session-Id 在头部，_raw 不返回头部，故会话复用依赖内核容忍无 session
+        self._mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
+        _, text = self._mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            session,
+        )
+        if not text:
+            raise SiYuanError(f"MCP 工具 {name} 返回空响应")
+        data = json.loads(text)
+        if "error" in data:
+            raise SiYuanError(f"MCP 错误: {data['error']}")
+        result = data.get("result") or {}
+        if result.get("isError"):
+            msgs = [c.get("text", "") for c in result.get("content", [])]
+            raise SiYuanError("MCP 调用失败: " + "; ".join(msgs))
+        if result.get("structuredContent") is not None:
+            return result["structuredContent"]
+        for c in result.get("content", []):
+            txt = c.get("text", "")
+            try:
+                return json.loads(txt)
+            except json.JSONDecodeError:
+                continue
+        return result
+
     def read_workspace_file(self, path: str) -> str:
         """/api/file/getFile 返回裸文件内容，不是 JSON 包络。"""
         raw = self._raw(
@@ -449,6 +529,36 @@ class Client:
                     "读取文件失败 %s: %s" % (path, data.get("msg") or data.get("code"))
                 )
         return text
+
+    def write_workspace_file(self, path: str, data: bytes):
+        """multipart: path + file（isDir=false），契约同 /api/file/putFile"""
+        boundary = "----SiYuanSkill" + uuid.uuid4().hex
+        body = bytearray()
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="path"\r\n\r\n'
+        body += f"{path}\r\n".encode()
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="isDir"\r\n\r\n'
+        body += b"false\r\n"
+        body += f"--{boundary}\r\n".encode()
+        body += (
+            'Content-Disposition: form-data; name="file"; '
+            f'filename="{Path(path).name}"\r\n'
+        ).encode()
+        body += b"Content-Type: application/octet-stream\r\n\r\n"
+        body += data + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        self._decode(
+            "/api/file/putFile",
+            self._raw(
+                "/api/file/putFile",
+                bytes(body),
+                {
+                    "Authorization": f"Token {self.conn.token}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            ),
+        )
 
     def daily_note(self, notebook: str, markdown: str) -> tuple[str, bool]:
         """按笔记本 dailyNoteSavePath（Sprig 模板）解析路径，打 custom-dailynote-yyyymmdd 标记。
@@ -1229,6 +1339,546 @@ def cmd_upload(args):
         print("在 create/append 的 Markdown 中直接用 ![alt](assets/...) 引用。")
 
 
+# ── 命令：数据层通用能力（对齐内置 MCP 工具面） ─────────────────────────────
+# 约定：一个命令 = MCP 工具的一个 action；权限仍按笔记本 R/W/D 判定，
+# 无法归属到笔记本的（工作区文件/同步/资源清理）要求「任一笔记本」具备该权限。
+
+
+def _need_yes(args, what: str):
+    if not getattr(args, "yes", False):
+        raise SiYuanError(f"{what} 不可逆：确认后加 --yes")
+
+
+def _str_of(data, key: str) -> str:
+    return data.get(key, "") if isinstance(data, dict) else ""
+
+
+def cmd_outline(args):
+    client, entry, _ = prepare(args, "outline")
+    Guard(client, entry, "outline").by_block(args.id, ["R"])
+    print_json(client.call("/api/outline/getDocOutline", {"id": args.id}))
+
+
+def cmd_backlinks(args):
+    client, entry, _ = prepare(args, "backlinks")
+    Guard(client, entry, "backlinks").by_block(args.id, ["R"])
+    ep = "/api/ref/getBacklinkDoc" if args.by_doc else "/api/ref/getBacklink"
+    payload = {"id": args.id}
+    if args.keyword:
+        payload["keyword"] = args.keyword
+    if args.sort:
+        payload["sort"] = args.sort
+    print_json(client.call(ep, payload))
+
+
+def cmd_attr(args):
+    op = f"attr_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    if args.action == "get":
+        guard.by_block(args.id, ["R"])
+        print_json(client.call("/api/attr/getBlockAttrs", {"id": args.id}))
+    elif args.action == "batch":
+        guard.any_perm("R")
+        print_json(client.call("/api/attr/batchGetBlockAttrs", {"ids": args.ids}))
+    else:
+        guard.by_block(args.id, ["W"])
+        attrs = {}
+        for kv in args.pairs:
+            k, sep, v = kv.partition("=")
+            if not sep:
+                raise SiYuanError(f"属性写法应为 key=value：{kv}")
+            attrs[k.strip()] = v
+        if not attrs:
+            raise SiYuanError("至少给一个 key=value")
+        client.set_block_attrs(args.id, attrs)
+        print_json({"id": args.id, "attrs": attrs, "ok": True})
+
+
+def cmd_block(args):
+    op = f"block_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    a = args.action
+    if a in ("children", "dom", "breadcrumb", "info", "kramdown"):
+        guard.by_block(args.id, ["R"])
+        if a == "kramdown":
+            data = client.call("/api/block/getBlockKramdown", {"id": args.id})
+            if args.json:
+                print_json(data)
+            else:
+                print(_str_of(data, "kramdown"))
+            return
+        endpoint = {
+            "children": "/api/block/getChildBlocks",
+            "dom": "/api/block/getBlockDOM",
+            "breadcrumb": "/api/block/getBlockBreadcrumb",
+            "info": "/api/block/getBlockInfo",
+        }[a]
+        print_json(client.call(endpoint, {"id": args.id}))
+    elif a == "delete":
+        guard.by_block(args.id, ["D"])
+        _need_yes(args, "删除块")
+        client.call("/api/block/deleteBlock", {"id": args.id})
+        print_json({"id": args.id, "deleted": True})
+    else:  # insert
+        body = read_content(args)
+        if args.parent:
+            guard.by_block(args.parent, ["W"])
+        else:
+            guard.any_perm("W")
+        payload = {"dataType": args.data_type, "data": body}
+        for key in ("parent", "previous_id", "next_id"):
+            val = getattr(args, key)
+            if val:
+                payload[{"parent": "parentID", "previous_id": "previousID", "next_id": "nextID"}[key]] = val
+        print_json(client.call("/api/block/insertBlock", payload))
+
+
+def _escape_go_template(text: str) -> str:
+    """把字面量 {{ }} 转义，避免 Sprig 把嵌入块/模板语法当 Go action 解析。"""
+
+    def rep(m):
+        return '{{"{{"}}' if m.group() == "{{" else '{{"}}"}}'
+
+    return re.sub(r"\{\{|\}\}", rep, text)
+
+
+def cmd_export(args):
+    client, entry, _ = prepare(args, "export_" + args.format)
+    guard = Guard(client, entry, "export_" + args.format)
+    guard.by_block(args.doc_id, ["R"])
+    if args.format == "md":
+        data = client.call("/api/export/exportMdContent", {"id": args.doc_id})
+        if args.json:
+            print_json(data)
+        else:
+            print(_str_of(data, "content"))
+    elif args.format == "html":
+        print_json(
+            client.call("/api/export/exportHTML", {"id": args.doc_id, "pdf": args.pdf})
+        )
+    else:
+        guard.by_block(args.doc_id, ["W"])  # 会在工作区写文件
+        print_json(
+            client.call(
+                "/api/export/exportDocx", {"id": args.doc_id, "output": args.output}
+            )
+        )
+
+
+def cmd_template(args):
+    op = f"template_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    rel = "data/templates/" + args.path.lstrip("/") if getattr(args, "path", "") else ""
+    if args.action == "ls":
+        guard.any_perm("R")
+        print_json(client.call("/api/file/readDir", {"path": "data/templates"}))
+    elif args.action == "get":
+        guard.any_perm("R")
+        print(client.read_workspace_file(rel))
+    elif args.action == "render":
+        guard.any_perm("R")
+        if args.id:
+            guard.by_block(args.id, ["R"])
+        text = _escape_go_template(client.read_workspace_file(rel))
+        print_json(client.render_sprig(text))
+    elif args.action == "save-as":
+        guard.by_block(args.id, ["W"])
+        print_json(
+            client.call(
+                "/api/template/docSaveAsTemplate",
+                {"id": args.id, "name": args.name, "overwrite": args.overwrite},
+            )
+        )
+    else:  # rm
+        guard.any_perm("D")
+        _need_yes(args, "删除模板")
+        client.call("/api/file/removeFile", {"path": rel})
+        print_json({"removed": rel})
+
+
+def cmd_file(args):
+    op = f"file_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    perm = {"ls": "R", "read": "R", "write": "W", "mv": "W", "cp": "W", "rm": "D"}
+    guard.any_perm(perm[args.action])
+    a = args.action
+    if a == "ls":
+        print_json(client.call("/api/file/readDir", {"path": args.path}))
+    elif a == "read":
+        print(client.read_workspace_file(args.path))
+    elif a == "write":
+        data = read_content(args).encode("utf-8")
+        client.write_workspace_file(args.path, data)
+        print_json({"path": args.path, "bytes": len(data), "written": True})
+    elif a == "rm":
+        _need_yes(args, "删除工作区文件")
+        client.call("/api/file/removeFile", {"path": args.path})
+        print_json({"path": args.path, "removed": True})
+    elif a == "mv":
+        client.call("/api/file/renameFile", {"path": args.path, "newPath": args.dest})
+        print_json({"from": args.path, "to": args.dest})
+    else:
+        client.call("/api/file/copyFile", {"src": args.path, "dest": args.dest})
+        print_json({"from": args.path, "to": args.dest})
+
+
+def cmd_notebook(args):
+    op = f"notebook_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    a = args.action
+    if a in ("open", "close", "rename", "icon"):
+        guard.by_notebook(args.id, ["W"])
+    else:
+        guard.any_perm("W")
+    endpoint = {
+        "open": "/api/notebook/openNotebook",
+        "close": "/api/notebook/closeNotebook",
+        "create": "/api/notebook/createNotebook",
+        "rename": "/api/notebook/renameNotebook",
+        "icon": "/api/notebook/setNotebookIcon",
+    }[a]
+    payload = {}
+    if a == "create":
+        payload["name"] = args.name
+    elif a in ("open", "close"):
+        payload["notebook"] = args.id
+    elif a == "rename":
+        payload["notebook"] = args.id
+        payload["name"] = args.name
+    else:  # icon
+        payload["notebook"] = args.id
+        payload["icon"] = args.icon
+    print_json(client.call(endpoint, payload))
+    # 新建/重命名/开关会影响权限表里的库集合与状态
+    resync = getattr(client, "resync", None)
+    if resync:
+        resync()
+
+
+def cmd_asset(args):
+    op = f"asset_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    a = args.action
+    if a == "unused":
+        guard.any_perm("R")
+        print_json(client.call("/api/asset/getUnusedAssets"))
+    elif a == "stat":
+        guard.any_perm("R")
+        # 实测：statAsset 要工作区相对路径（assets/x.png），带前导 / 会 code=1
+        print_json(client.call("/api/asset/statAsset", {"path": args.path.lstrip("/")}))
+    else:
+        guard.any_perm("D")
+        _need_yes(args, "清理未引用资源")
+        assets = client.call("/api/asset/getUnusedAssets") or []
+        removed = []
+        for item in assets:
+            path = item.get("path") if isinstance(item, dict) else str(item)
+            if not path:
+                continue
+            client.call("/api/asset/removeUnusedAsset", {"path": path})
+            removed.append(path)
+        print_json({"removed": removed, "count": len(removed)})
+
+
+def cmd_sync(args):
+    op = f"sync_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    if args.action == "status":
+        guard.any_perm("R")
+        print_json(client.call("/api/sync/getSyncInfo"))
+        return
+    guard.any_perm("D")
+    _need_yes(args, "触发数据同步")
+    print_json(client.call("/api/sync/performSync"))
+
+
+def cmd_bookmark(args):
+    op = f"bookmark_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    a = args.action
+    if a == "ls":
+        guard.any_perm("R")
+        print_json(client.call("/api/bookmark/getBookmark"))
+    elif a == "rename":
+        guard.any_perm("W")
+        print_json(
+            client.call("/api/bookmark/renameBookmark", {"oldLabel": args.old, "newLabel": args.new})
+        )
+    else:
+        guard.any_perm("D")
+        _need_yes(args, "删除书签")
+        print_json(client.call("/api/bookmark/removeBookmark", {"label": args.label}))
+
+
+def cmd_system(args):
+    client, entry, _ = prepare(args, "system")
+    Guard(client, entry, "system").any_perm("R")
+    print_json(
+        {
+            "version": client.version(),
+            "workspace": client.call("/api/system/getWorkspaceInfo"),
+            "time": client.call("/api/system/currentTime"),
+        }
+    )
+
+
+def _resolve_av_id(client, block_id: str) -> str:
+    """数据库块的块 id 与 av id 不同：从 block DOM 的 data-av-id 里取真正的 avID。"""
+    if client.call("/api/av/getAttributeView", {"id": block_id}).get("av"):
+        return block_id
+    dom = _str_of(client.call("/api/block/getBlockDOM", {"id": block_id}), "dom")
+    m = re.search(r'data-av-id="([^"]+)"', dom)
+    return m.group(1) if m else block_id
+
+
+def cmd_av(args):
+    """数据库（属性视图）全部动作走内核 MCP：HTTP API 只读且参数口径不一。"""
+    op = f"av_{args.action}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    a = args.action
+    if a == "create":
+        guard.by_block(args.parent, ["W"])
+        payload = {"action": "create", "parentID": args.parent, "name": args.name}
+        if args.layout:
+            payload["layout"] = args.layout
+        if args.keys:
+            try:
+                payload["keys"] = json.loads(args.keys)
+            except json.JSONDecodeError as e:
+                raise SiYuanError(f"--keys 需为 JSON 数组：[{{\"name\":\"状态\",\"type\":\"text\"}}]：{e}") from e
+        res = client.mcp_call("database", payload)
+        data = (res or {}).get("data", res) or {}
+        if args.json:
+            print_json(data)
+        else:
+            print(f"✅ 已创建数据库 {data.get('avID')}（块 {data.get('blockID')}）")
+        return
+    if a == "search":
+        guard.any_perm("R")
+        print_json(client.mcp_call("database", {"action": "search", "keyword": args.keyword}))
+        return
+    perm = {
+        "view": "R", "keys": "R",
+        "add-item": "W", "add-key": "W",
+        "rm-item": "D", "rm-key": "D",
+    }[a]
+    guard.by_block(args.id, [perm])
+    av_id = _resolve_av_id(client, args.id)
+    if a in ("view", "keys"):
+        payload = {"action": "get" if a == "view" else "keys", "id": av_id}
+        print_json(client.mcp_call("database", payload))
+    elif a == "add-key":
+        print_json(
+            client.mcp_call(
+                "database", {"action": "key_add", "id": av_id, "name": args.name, "icon": args.icon or ""}
+            )
+        )
+    elif a == "rm-key":
+        _need_yes(args, "删除数据库字段")
+        print_json(client.mcp_call("database", {"action": "key_remove", "id": av_id, "keyID": args.key_id}))
+    elif a == "add-item":
+        payload = {"action": "item_add", "id": av_id}
+        if args.block:
+            payload["blockID"] = args.block
+        if args.content:
+            payload["content"] = args.content
+        if args.detached:
+            payload["detached"] = True
+        print_json(client.mcp_call("database", payload))
+    else:  # rm-item
+        _need_yes(args, "删除数据库条目")
+        print_json(
+            client.mcp_call("database", {"action": "item_remove", "id": av_id, "itemIDs": args.item_ids})
+        )
+
+
+MCP_TOOL_PERM = {
+    "asset": "W", "attr": "W", "block": "W", "bookmark": "W", "dailynote": "W",
+    "database": "W", "document": "W", "export": "R", "file": "W", "history": "R",
+    "http_request": "W", "image": "W", "import": "W", "inbox": "W", "notebook": "W",
+    "outline": "R", "ref": "R", "repo": "D", "search": "R", "skill": "R", "sql": "R",
+    "sync": "D", "system": "R", "tag": "W", "template": "W", "unzip": "W",
+    "web_fetch": "R", "web_search": "R", "workspace": "W",
+}
+
+
+def _mcp_perm(tool: str, action: str, explicit: str) -> str:
+    if explicit:
+        perm = explicit.upper()
+        if perm not in VALID_PERMS:
+            raise SiYuanError(f"--perm 只允许 {'/'.join(VALID_PERMS)}")
+        return perm
+    act = (action or "").lower()
+    if any(k in act for k in ("delete", "remove", "purge", "clear", "rollback", "checkout")):
+        return "D"
+    if any(k in act for k in ("create", "add", "append", "update", "set", "rename", "move", "write", "import", "upload", "insert", "prepend", "replace", "sort", "copy")):
+        return "W"
+    return MCP_TOOL_PERM.get(tool, "R")
+
+
+def cmd_mcp(args):
+    """通用 MCP 工具调用：补齐 HTTP API 未开放的少量内核能力。"""
+    tool = args.tool
+    payload = {}
+    if args.body:
+        try:
+            payload = json.loads(args.body)
+        except json.JSONDecodeError as e:
+            raise SiYuanError(f"--body 需为 JSON 对象: {e}") from e
+    for kv in args.arg or []:
+        k, sep, v = kv.partition("=")
+        if not sep:
+            raise SiYuanError(f"--arg 写法应为 key=value：{kv}")
+        try:
+            payload[k.strip()] = json.loads(v)
+        except json.JSONDecodeError:
+            payload[k.strip()] = v
+    op = f"mcp:{tool}:{payload.get('action', '')}"
+    client, entry, _ = prepare(args, op)
+    guard = Guard(client, entry, op)
+    perm = _mcp_perm(tool, str(payload.get("action", "")), args.perm)
+    if perm == "D":
+        _need_yes(args, f"MCP {tool}")
+    if args.notebook:
+        guard.by_notebook(args.notebook, [perm])
+    else:
+        guard.any_perm(perm)
+    print_json(client.mcp_call(tool, payload))
+
+
+def cmd_import(args):
+    client, entry, _ = prepare(args, "import_md")
+    Guard(client, entry, "import_md").by_notebook(args.notebook, ["W"])
+    payload = {"notebook": args.notebook, "localPath": args.path}
+    if args.target:
+        payload["toPath"] = args.target
+    print_json(client.call("/api/import/importStdMd", payload))
+
+
+# endpoint → 所需权限；只收录已在 3.8.2 实测存在的端点
+CALL_TABLE = {
+    # 只读
+    "/api/search/searchAsset": "R",
+    "/api/av/getAttributeViewPrimaryKeyValues": "R",
+    "/api/system/currentTime": "R",
+    "/api/system/version": "R",
+    "/api/system/getWorkspaceInfo": "R",
+    "/api/outline/getDocOutline": "R",
+    "/api/ref/getBacklink": "R",
+    "/api/ref/getBacklinkDoc": "R",
+    "/api/block/getBlockKramdown": "R",
+    "/api/block/getBlockDOM": "R",
+    "/api/block/getChildBlocks": "R",
+    "/api/block/getBlockBreadcrumb": "R",
+    "/api/export/exportMdContent": "R",
+    "/api/export/exportDocx": "W",
+    "/api/history/getHistoryItems": "R",
+    "/api/history/getHistoryDirs": "R",
+    "/api/repo/getRepoSnapshots": "R",
+    "/api/repo/diffRepoSnapshots": "R",
+    "/api/repo/openRepoSnapshotFile": "R",
+    "/api/export/exportMd": "W",
+    "/api/export/exportHTML": "R",
+    "/api/export/exportSY": "W",
+    "/api/export/exportResources": "R",
+    "/api/search/searchRefBlock": "R",
+    "/api/search/searchWidget": "R",
+    "/api/block/getBlockIndex": "R",
+    "/api/block/getDocsInfo": "R",
+    "/api/filetree/listDocTree": "R",
+    "/api/filetree/getDoc": "R",
+    "/api/filetree/getPathByID": "R",
+    "/api/filetree/getHPathByID": "R",
+    "/api/attr/getBlockAttrs": "R",
+    "/api/notebook/lsNotebooks": "R",
+    "/api/system/bootProgress": "R",
+    "/api/system/getConf": "R",
+    "/api/system/getWorkspaces": "R",
+    # 写入
+    "/api/block/insertBlock": "W",
+    "/api/block/prependBlock": "W",
+    "/api/block/appendBlock": "W",
+    "/api/block/updateBlock": "W",
+    "/api/block/foldBlock": "W",
+    "/api/attr/setBlockAttrs": "W",
+    "/api/filetree/createDocWithMd": "W",
+    "/api/filetree/renameDoc": "W",
+    "/api/filetree/moveDocsByID": "W",
+    "/api/file/putFile": "W",
+    "/api/file/renameFile": "W",
+    "/api/file/copyFile": "W",
+    "/api/template/renderSprig": "R",
+    "/api/template/docSaveAsTemplate": "W",
+    "/api/notebook/createNotebook": "W",
+    "/api/notebook/renameNotebook": "W",
+    "/api/notebook/setNotebookIcon": "W",
+    "/api/tag/renameTag": "W",
+    "/api/av/addAttributeViewKey": "W",
+    "/api/av/addAttributeViewBlocks": "W",
+    "/api/asset/uploadCloud": "W",
+    "/api/history/rollbackDocByCreated": "D",
+    # 删除 / 破坏性
+    "/api/block/deleteBlock": "D",
+    "/api/filetree/removeDoc": "D",
+    "/api/filetree/removeDocs": "D",
+    "/api/file/removeFile": "D",
+    "/api/notebook/removeNotebook": "D",
+    "/api/tag/removeTag": "D",
+    "/api/asset/removeUnusedAsset": "D",
+    "/api/av/removeAttributeViewKey": "D",
+    "/api/av/removeAttributeViewBlocks": "D",
+    "/api/repo/purgeRepo": "D",
+    "/api/riff/removeRiffCards": "D",
+    # 只读补充
+    "/api/riff/getRiffDecks": "R",
+    "/api/riff/getRiffCards": "R",
+    "/api/riff/createRiffDeck": "W",
+    "/api/riff/addRiffCards": "W",
+}
+
+
+def cmd_call(args):
+    endpoint = args.endpoint.strip()
+    if endpoint not in CALL_TABLE:
+        raise SiYuanError(
+            f"端点 {endpoint} 未在白名单内（有风险或未实测）。可用端点见 "
+            "references/siyuan-api.md 的「call 白名单」小节"
+        )
+    perm = CALL_TABLE[endpoint]
+    client, entry, _ = prepare(args, f"call:{endpoint}")
+    guard = Guard(client, entry, f"call:{endpoint}")
+    if args.notebook:
+        guard.by_notebook(args.notebook, [perm])
+    else:
+        guard.any_perm(perm)
+    if perm == "D" and not args.notebook:
+        _need_yes(args, f"调用 {endpoint}")
+    payload: dict = {}
+    if args.body:
+        try:
+            payload = json.loads(args.body)
+        except json.JSONDecodeError as e:
+            raise SiYuanError(f"--body 不是合法 JSON：{e}") from e
+    for kv in args.arg or []:
+        k, sep, v = kv.partition("=")
+        if not sep:
+            raise SiYuanError(f"--arg 写法应为 key=value：{kv}")
+        try:
+            payload[k] = json.loads(v)
+        except json.JSONDecodeError:
+            payload[k] = v
+    print_json(client.call(endpoint, payload))
+
+
 # ── 内容读取 ─────────────────────────────────────────────────────────────────
 
 
@@ -1366,6 +2016,206 @@ def build_parser() -> argparse.ArgumentParser:
     sp = cmd("upload", "上传图片/附件到 assets（需目标笔记本 W）", cmd_upload)
     sp.add_argument("notebook")
     sp.add_argument("paths", nargs="+")
+
+    # ── 数据层通用能力（对齐内置 MCP 工具面）──
+    sp = cmd("outline", "文档大纲层级（需 R）", cmd_outline)
+    sp.add_argument("id")
+
+    sp = cmd("backlinks", "反链查询（需 R）", cmd_backlinks)
+    sp.add_argument("id")
+    sp.add_argument("--by-doc", action="store_true", help="按文档聚合反链")
+    sp.add_argument("--keyword", default="")
+    sp.add_argument("--sort", type=int, default=0)
+
+    sp = cmd("attr", "块属性：get（R）/ set（W）/ batch（R）", cmd_attr)
+    asub = sp.add_subparsers(dest="action", required=True)
+    ag = asub.add_parser("get", parents=[common])
+    ag.add_argument("id")
+    ag.set_defaults(func=cmd_attr, action="get")
+    ase = asub.add_parser("set", parents=[common])
+    ase.add_argument("id")
+    ase.add_argument("pairs", nargs="+", help="key=value …，如 name=标题 custom-progress=30")
+    ase.set_defaults(func=cmd_attr, action="set")
+    ab = asub.add_parser("batch", parents=[common])
+    ab.add_argument("ids", help="逗号分隔的块 id")
+    ab.set_defaults(func=cmd_attr, action="batch")
+
+    sp = cmd("block", "块操作：kramdown/children/dom/breadcrumb/info（R）、insert（W）、delete（D）", cmd_block)
+    bsub = sp.add_subparsers(dest="action", required=True)
+    for act, helptext in (
+        ("kramdown", "块源码（含 IAL）"),
+        ("children", "子块列表"),
+        ("dom", "渲染后 DOM 摘要"),
+        ("breadcrumb", "面包屑路径"),
+        ("info", "块元信息"),
+    ):
+        bp = bsub.add_parser(act, help=helptext, parents=[common])
+        bp.add_argument("id")
+        bp.set_defaults(func=cmd_block, action=act)
+    bd = bsub.add_parser("delete", help="删除块（D，需 --yes）", parents=[common])
+    bd.add_argument("id")
+    bd.add_argument("--yes", "-y", action="store_true")
+    bd.set_defaults(func=cmd_block, action="delete")
+    bi = bsub.add_parser("insert", help="插入块（W）", parents=[common])
+    bi.add_argument("--parent", default="", help="父块/文档 id")
+    bi.add_argument("--previous-id", default="", help="插到该块之后")
+    bi.add_argument("--next-id", default="", help="插到该块之前")
+    bi.add_argument("--data-type", default="markdown", choices=["markdown", "dom"])
+    add_content(bi)
+    bi.set_defaults(func=cmd_block, action="insert")
+
+    sp = cmd("export", "导出文档：md/html（R）/ docx（W，写工作区文件）", cmd_export)
+    sp.add_argument("format", choices=["md", "html", "docx"])
+    sp.add_argument("doc_id")
+    sp.add_argument("--output", "-o", default="", help="docx 输出路径（工作区相对）")
+    sp.add_argument("--pdf", action="store_true", help="html 导出按 PDF 版式处理")
+
+    sp = cmd("template", "模板：ls/get/render/save-as/rm", cmd_template)
+    tsub = sp.add_subparsers(dest="action", required=True)
+    for act, helptext in (("ls", "列出模板"), ("get", "读取模板源码")):
+        tp = tsub.add_parser(act, parents=[common])
+        tp.set_defaults(func=cmd_template, action=act)
+    tr = tsub.add_parser("render", parents=[common])
+    tr.add_argument("path")
+    tr.add_argument("--id", default="", help="渲染上下文的块 id")
+    tr.set_defaults(func=cmd_template, action="render")
+    tsa = tsub.add_parser("save-as", help="文档存为模板（W）", parents=[common])
+    tsa.add_argument("id")
+    tsa.add_argument("name")
+    tsa.add_argument("--overwrite", action="store_true")
+    tsa.set_defaults(func=cmd_template, action="save-as")
+    trm = tsub.add_parser("rm", help="删除模板（D，需 --yes）", parents=[common])
+    trm.add_argument("path")
+    trm.add_argument("--yes", "-y", action="store_true")
+    trm.set_defaults(func=cmd_template, action="rm")
+
+    sp = cmd("file", "工作区文件：ls/read（R）、write/mv/cp（W）、rm（D）", cmd_file)
+    fsub = sp.add_subparsers(dest="action", required=True)
+    for act in ("ls", "read"):
+        fp = fsub.add_parser(act, parents=[common])
+        fp.add_argument("path")
+        fp.set_defaults(func=cmd_file, action=act)
+    fw = fsub.add_parser("write", parents=[common])
+    fw.add_argument("path")
+    add_content(fw)
+    fw.set_defaults(func=cmd_file, action="write")
+    for act in ("mv", "cp"):
+        fp = fsub.add_parser(act, parents=[common])
+        fp.add_argument("path")
+        fp.add_argument("dest")
+        fp.set_defaults(func=cmd_file, action=act)
+    fr = fsub.add_parser("rm", parents=[common])
+    fr.add_argument("path")
+    fr.add_argument("--yes", "-y", action="store_true")
+    fr.set_defaults(func=cmd_file, action="rm")
+
+    sp = cmd("notebook", "笔记本：open/close/create/rename/icon（W）", cmd_notebook)
+    nsub = sp.add_subparsers(dest="action", required=True)
+    for act in ("open", "close", "rename"):
+        np_ = nsub.add_parser(act, parents=[common])
+        np_.add_argument("id")
+        if act == "rename":
+            np_.add_argument("name")
+        np_.set_defaults(func=cmd_notebook, action=act)
+    nc = nsub.add_parser("create", parents=[common])
+    nc.add_argument("name")
+    nc.set_defaults(func=cmd_notebook, action="create")
+    ni = nsub.add_parser("icon", parents=[common])
+    ni.add_argument("id")
+    ni.add_argument("icon")
+    ni.set_defaults(func=cmd_notebook, action="icon")
+
+    sp = cmd("asset", "资源：unused/stat（R）、clean（D）", cmd_asset)
+    asub2 = sp.add_subparsers(dest="action", required=True)
+    au = asub2.add_parser("unused", parents=[common])
+    au.set_defaults(func=cmd_asset, action="unused")
+    ast = asub2.add_parser("stat", parents=[common])
+    ast.add_argument("path")
+    ast.set_defaults(func=cmd_asset, action="stat")
+    ac = asub2.add_parser("clean", parents=[common])
+    ac.add_argument("--yes", "-y", action="store_true")
+    ac.set_defaults(func=cmd_asset, action="clean")
+
+    sp = cmd("sync", "数据同步：status（R）/ perform（D，需 --yes）", cmd_sync)
+    ssub2 = sp.add_subparsers(dest="action", required=True)
+    ss = ssub2.add_parser("status", parents=[common])
+    ss.set_defaults(func=cmd_sync, action="status")
+    spf = ssub2.add_parser("perform", parents=[common])
+    spf.add_argument("--yes", "-y", action="store_true")
+    spf.set_defaults(func=cmd_sync, action="perform")
+
+    sp = cmd("bookmark", "书签：ls（R）/ rename（W）/ rm（D）", cmd_bookmark)
+    ksub = sp.add_subparsers(dest="action", required=True)
+    kl = ksub.add_parser("ls", parents=[common])
+    kl.set_defaults(func=cmd_bookmark, action="ls")
+    kr = ksub.add_parser("rename", parents=[common])
+    kr.add_argument("old")
+    kr.add_argument("new")
+    kr.set_defaults(func=cmd_bookmark, action="rename")
+    krm = ksub.add_parser("rm", parents=[common])
+    krm.add_argument("label")
+    krm.add_argument("--yes", "-y", action="store_true")
+    krm.set_defaults(func=cmd_bookmark, action="rm")
+
+    cmd("system", "版本/工作区/当前时间（需 R）", cmd_system)
+
+    sp = cmd("av", "数据库（属性视图，走内置 MCP）：create/view/keys/add-item/add-key/rm-item/rm-key", cmd_av)
+    vsub = sp.add_subparsers(dest="action", required=True)
+    vc = vsub.add_parser("create", help="创建数据库（W）", parents=[common])
+    vc.add_argument("parent", help="父文档/块 id")
+    vc.add_argument("name")
+    vc.add_argument("--layout", default="", choices=["", "table", "gallery", "kanban"])
+    vc.add_argument("--keys", default="", help='JSON：[{"name":"状态","type":"text"}]')
+    vc.set_defaults(func=cmd_av, action="create")
+    for act in ("view", "keys"):
+        vp = vsub.add_parser(act, parents=[common])
+        vp.add_argument("id")
+        vp.set_defaults(func=cmd_av, action=act)
+    vs = vsub.add_parser("search", help="按名称搜索数据库（R）", parents=[common])
+    vs.add_argument("keyword")
+    vs.set_defaults(func=cmd_av, action="search")
+    va = vsub.add_parser("add-item", help="新增条目（W）", parents=[common])
+    va.add_argument("id")
+    va.add_argument("--content", default="", help="主键列文本")
+    va.add_argument("--block", default="", help="绑定已有块 id")
+    va.add_argument("--detached", action="store_true", help="创建游离条目")
+    va.set_defaults(func=cmd_av, action="add-item")
+    vr = vsub.add_parser("rm-item", help="删除条目（D，需 --yes）", parents=[common])
+    vr.add_argument("id")
+    vr.add_argument("item_ids", nargs="+")
+    vr.add_argument("--yes", "-y", action="store_true")
+    vr.set_defaults(func=cmd_av, action="rm-item")
+    vak = vsub.add_parser("add-key", help="新增字段（W）", parents=[common])
+    vak.add_argument("id")
+    vak.add_argument("name")
+    vak.add_argument("--icon", default="")
+    vak.set_defaults(func=cmd_av, action="add-key")
+    vrk = vsub.add_parser("rm-key", help="删除字段（D，需 --yes）", parents=[common])
+    vrk.add_argument("id")
+    vrk.add_argument("key_id")
+    vrk.add_argument("--yes", "-y", action="store_true")
+    vrk.set_defaults(func=cmd_av, action="rm-key")
+
+    sp = cmd("mcp", "直接调用内核内置 MCP 工具（补齐 HTTP API 缺口）", cmd_mcp)
+    sp.add_argument("tool", help="MCP 工具名，如 database / skill / web_search")
+    sp.add_argument("--action", default="", help="动作名（用于权限推断）")
+    sp.add_argument("--body", default="", help="JSON body")
+    sp.add_argument("--arg", action="append", metavar="K=V", help="拼 body（值按 JSON 解析）")
+    sp.add_argument("--notebook", default="", help="按该笔记本校验权限（缺省=任一同级权限）")
+    sp.add_argument("--perm", default="", help="显式指定 R/W/D（默认按动作推断）")
+    sp.add_argument("--yes", "-y", action="store_true", help="D 类操作必须确认")
+
+    sp = cmd("import", "导入本地 Markdown 目录/文件（需目标笔记本 W）", cmd_import)
+    sp.add_argument("notebook")
+    sp.add_argument("path", help="服务器本地绝对路径")
+    sp.add_argument("--target", default="", help="导入到该 hpath 下")
+
+    sp = cmd("call", "通用端点调用（白名单 + 权限审计）", cmd_call)
+    sp.add_argument("endpoint", help="如 /api/riff/getRiffDecks")
+    sp.add_argument("--body", default="", help="JSON body")
+    sp.add_argument("--arg", action="append", metavar="K=V", help="拼 body（值按 JSON 解析）")
+    sp.add_argument("--notebook", default="", help="按该笔记本校验权限（缺省=任一同级权限）")
+    sp.add_argument("--yes", "-y", action="store_true", help="D 类端点必须确认")
 
     return p
 

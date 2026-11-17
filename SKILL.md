@@ -1,7 +1,7 @@
 ---
 name: siyuan
-description: 操作远程 SiYuan（思源笔记）：搜索、读文档、创建/追加/更新、移动、文档树、日记、快照、标签、图片上传。当用户说「操作 SiYuan / 思源笔记 / 在思源里搜一下 / 写进思源 / 记到思源 / 追加到某篇文档 / 上传图片到思源 / 看最近笔记 / 做个快照 / 回滚快照」时使用。凭据只从环境变量读取（SIYUAN_API_URL / SIYUAN_TOKEN），权限表存于 ~/.config/.siyuan.json 并按实例地址分组；所有笔记本数据操作前必须通过 R/W/D 权限 GUARD，首次同步后必须先引导用户确认权限。
-version: 1.1.0
+description: 操作远程 SiYuan（思源笔记）：搜索、读文档、创建/追加/更新、移动、文档树、日记、块属性/块操作、大纲/反链、模板、导出、工作区文件、资源、书签、系统信息、数据库（av，走内置 MCP）、只读 SQL、快照、标签、图片上传。当用户说「操作 SiYuan / 思源笔记 / 在思源里搜一下 / 写进思源 / 记到思源 / 追加到某篇文档 / 上传图片到思源 / 看最近笔记 / 做个快照 / 回滚快照」时使用。凭据只从环境变量读取（SIYUAN_API_URL / SIYUAN_TOKEN），权限表存于 ~/.config/.siyuan.json 并按实例地址分组；所有笔记本数据操作前必须通过 R/W/D 权限 GUARD，首次同步后必须先引导用户确认权限。
+version: 1.2.0
 ---
 
 # SiYuan 远程笔记操作 (siyuan)
@@ -99,11 +99,38 @@ python3 $S perms confirm                   # 用户明确同意后才执行
 | `snapshot create` | 任一笔记本 `R`（只读备份） |
 | `search` / `tree`（无目标）/ `recent` / `tags` / `snapshot list` | 任一笔记本 `R` |
 | `tree <notebook>` | 该笔记本 `R` |
-| `ping` / `notebooks` / `perms` | 审计豁免（发现新库的入口） |
+| `outline` / `backlinks` / `block kramdown|children|dom|breadcrumb|info` / `attr get|batch` / `export md|html` / `av view|keys|search` | 该块所属笔记本 `R` |
+| `attr set` / `block insert`（带 `--parent`）/ `template save-as` / `av add-item|add-key` | 该块所属笔记本 `W` |
+| `block delete` / `av rm-item|rm-key` | 该块所属笔记本 `D`（`block delete` 需 `--yes`） |
+| `file ls|read` / `template ls|get|render` / `asset unused|stat` / `sync status` / `bookmark ls` / `system` | 任一笔记本 `R` |
+| `file write|mv|cp` / `notebook *` / `import` / `asset clean` | 任一笔记本 `W`（`notebook` 针对具体库时要求该库 `W`） |
+| `file rm` / `template rm` / `sync perform` / `bookmark rm` / `asset clean`（实际删除） | 任一笔记本 `D`，且需 `--yes` |
+| `mcp <tool>` / `call <endpoint>` | 按工具/端点映射 R/W/D；D 类需 `--yes`，显式 `--perm` 可覆盖 |
+| `ping` / `notebooks` / `perms` / `selftest` | 审计豁免（发现新库的入口） |
 
 拒绝消息包含：目标笔记本（id+name）、需要的权限、缺失的权限、操作名。退出码：`2` = 权限/确认拒绝，`1` = 连接/参数错误。
 
 权限表按需同步：常见按库读写不再额外拉笔记本列表；仅当库不在表中（新建库）或执行「全库」判定（retag / rollback）时才同步一次，新库自动按默认 `R` 记入；`ping` / `notebooks` 可随时手动刷新。
+
+## 能力边界（动手前先看一眼）
+
+| 类别 | 边界 | 你怎么做 |
+| --- | --- | --- |
+| 权限 | GUARD 是**防误操作**，token 本身是管理员全权 | 不把 CLI 暴露给不可信调用方；敏感库设 `NONE` |
+| 一致性 | 无事务、无锁、last-write-wins；索引异步数秒 | 先 `read` 再改；写后不要立刻用 SQL 断言；大改先 `snapshot create` |
+| 快照 | 整库级，无法单库/单文档回滚 | 回滚前必须给预览并取得用户同意 |
+| 导出 | `export md` 有损（补标题、丢 IAL、压表格） | 要源码用 `block kramdown` |
+| 数据库 | HTTP 无建库端点，只能走 MCP | 用 `av *`（已内置 MCP 桥） |
+| 传输 | `curl` 内联中文 JSON 会乱码 | 一律走 CLI（`-c`/`-f`/stdin） |
+| 在线 | 内核不在线 = 无数据层；只读模式下写请求被拒 | 先 `ping`，别把 403 当权限表问题 |
+
+完整清单、场景可行性速判、反模式、部署检查表：`references/limitations.md`。
+
+### 什么时候不用 CLI
+
+- 需要实时协同编辑、精细排版 → 交给人。
+- 需要数据库视图/关联/汇总等高级字段 → 内建 MCP `database` 或人工。
+- 需要单文档历史回滚 → `mcp history`（`snapshot` 是整库）。
 
 ## 命令速查
 
@@ -133,6 +160,31 @@ python3 $S snapshot rollback <snapshotId> [--yes]   # 不加 --yes 只预览
 python3 $S tags
 python3 $S retag <旧标签> <新标签>          # 需所有库 W
 python3 $S upload <notebookId> a.png b.jpg  # 需目标库 W
+
+# ── 数据层通用能力（对齐内置 MCP 工具面）──
+python3 $S outline <docId>                    # 文档大纲（R）
+python3 $S backlinks <id> [--by-doc]          # 反链（R）
+python3 $S attr get <id>                      # 块属性（R）
+python3 $S attr set <id> name=标题 custom-progress=30   # 属性（W）
+python3 $S block kramdown <id>                # 精确源码（含 IAL）
+python3 $S block children|dom|breadcrumb|info <id>
+python3 $S block insert --parent <id> -f part.md        # 插入块（W）
+python3 $S block delete <id> --yes                      # 删除块（D）
+python3 $S export md <docId> > out.md         # 导出 Markdown（R）
+python3 $S export html <docId> | jq -r .content
+python3 $S export docx <docId> -o out.docx    # 写工作区文件（W）
+python3 $S template ls|get|render|save-as|rm  # data/templates（渲染自动转义 {{ }}）
+python3 $S file ls|read|write|mv|cp|rm <path> # 工作区文件（data/ 等）
+python3 $S notebook open|close|create|rename|icon
+python3 $S asset unused|stat|clean            # 资源统计/清理（clean 需 --yes）
+python3 $S sync status [perform --yes]        # 同步状态（perform 为 D）
+python3 $S bookmark ls|rename|rm
+python3 $S system                             # 版本/工作区/当前时间
+python3 $S av create <parentId> 任务表 --keys '[{"name":"状态","type":"text"}]'
+python3 $S av view|keys|search|add-item|add-key|rm-item|rm-key
+python3 $S import <notebookId> /abs/path [--target /归档]   # 服务器本地已同步目录
+python3 $S mcp <tool> --action <act> --arg k=v              # 内置 MCP 工具直调
+python3 $S call <endpoint> --arg k=v [--notebook <id>] [--yes]  # 白名单端点
 ```
 
 正文输入：`-c/--content`、`-f/--file`（`-` = stdin），或无参数时从管道读：
@@ -228,5 +280,6 @@ python3 $S snapshot rollback <id> --yes    # 用户明确同意后再执行
 - `scripts/siyuan.py` — 全部实现（HTTP + 权限 GUARD + 权限表）
 - `references/siyuan-markdown.md` — **写正文必读**：行级/块级语法、超级块、IAL、调用约定、易错清单
 - `references/siyuan-operations.md` — 任务配方：建文档/移动/属性/日记/模板/搜索/数据库/资源/快照/导出
-- `references/siyuan-api.md` — 端点全量、块类型、SQL schema、上传契约、反代坑、docker 联调
+- `references/siyuan-api.md` — 端点全量、块类型、SQL schema、上传契约、反代坑、docker 联调、`call` 白名单
+- `references/limitations.md` — **能力边界与限制**：硬限制、坑与对策、场景可行性、反模式、部署检查表
 - `test/smoke.py` — mock 服务端到端自检（`python3 test/smoke.py`）

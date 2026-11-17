@@ -314,5 +314,129 @@ curl -s -X POST "$SIYUAN_API_URL/api/repo/checkoutRepo" -d '{"id":"<snapshotId>"
 | 上传 | `siyuan.py upload <file...>` |
 | 快照 | `siyuan.py snapshot <create|list|rollback>` |
 | 任意 SQL | `siyuan.py sql "<stmt>"` |
+| 大纲 / 反链 | `siyuan.py outline <docId>` / `backlinks <id> [--by-doc]` |
+| 块属性 | `siyuan.py attr get|set|batch` |
+| 块操作 | `siyuan.py block kramdown|children|dom|breadcrumb|info|insert|delete` |
+| 导出 | `siyuan.py export md|html|docx <docId>` |
+| 模板 | `siyuan.py template ls|get|render|save-as|rm` |
+| 工作区文件 | `siyuan.py file ls|read|write|mv|cp|rm` |
+| 笔记本管理 | `siyuan.py notebook open|close|create|rename|icon` |
+| 资源 | `siyuan.py asset unused|stat|clean` |
+| 同步 | `siyuan.py sync status|perform` |
+| 书签 | `siyuan.py bookmark ls|rename|rm` |
+| 系统 | `siyuan.py system` |
+| 数据库 | `siyuan.py av create|view|keys|search|add-item|add-key|rm-item|rm-key` |
+| 内置 MCP | `siyuan.py mcp <tool> --action <act> --arg k=v` |
+| 白名单端点 | `siyuan.py call <endpoint> --arg k=v [--notebook <id>]` |
 
-CLI 未覆盖的端点（属性、数据库、模板、导出、转换）按本文档直接 curl；需要频繁使用时再扩展 CLI。
+---
+
+## 16. P0 实战配方（社区高频场景）
+
+### 16.1 收件箱投递（幂等）
+
+把碎片想法投到「Inbox」笔记本，重复投递不产生重复文档。
+
+```bash
+# 1) 先查今天是否已有收件箱文档
+python3 scripts/siyuan.py sql "select id,hpath from blocks where type='d' and box='<INBOX_NB>' and hpath like '/%2026-11-17%' limit 1"
+
+# 2) 没有就建（路径幂等，日期即标题）
+python3 scripts/siyuan.py create <INBOX_NB> "/2026-11-17 收件箱" -c "## 09:12 想法
+- 内容"
+
+# 3) 已有就追加
+python3 scripts/siyuan.py append <docId> -c "
+- **10:30** 第二条"
+```
+
+要点：`createDocWithMd` 对同一路径会复用文档（不传重复），这是幂等的关键；不要用随机标题。
+
+### 16.2 日记任务（任务清单 + 未完成结转）
+
+```bash
+python3 scripts/siyuan.py daily <NB> -c "## 今日
+- [ ] 写方案
+- [ ] 回邮件"
+# 昨天的未完成任务（嵌入块也能做到，见 siyuan-markdown.md）
+python3 scripts/siyuan.py sql "select id from blocks where type='i' and markdown like '%- [ ]%' and box='<NB>' order by updated desc limit 5"
+```
+
+要点：任务列表导出是 `[X]`（大写）；`daily` 已按 `dailyNoteSavePath` + Sprig 生成路径，并写入 `custom-dailynote-YYYYMMDD` 属性。
+
+### 16.3 仪表盘 / 日报聚合（只读）
+
+```bash
+# 各库文档数、最近 7 天更新
+python3 scripts/siyuan.py sql "select box,count(*) c from blocks where type='d' group by box order by c desc"
+python3 scripts/siyuan.py sql "select hpath,updated from blocks where type='d' and updated > strftime('%Y%m%d%H%M%S','now','-7 day') order by updated desc limit 20"
+# 产出快照写入指定文档
+python3 scripts/siyuan.py update <dashboardDocId> -c "## 周报
+（粘贴上面的结果）"
+```
+
+要点：`update` 覆盖首块 —— 只对「自己刚读过的仪表盘文档」用；其它场景用 `append`。
+
+### 16.4 体检 SQL（库健康）
+
+```bash
+# 无标签 / 无标题 / 很久没动的孤儿文档
+python3 scripts/siyuan.py sql "select id,hpath from blocks where type='d' and tag='' "
+python3 scripts/siyuan.py sql "select id,hpath from blocks where type='d' and content='' "
+python3 scripts/siyuan.py sql "select hpath,max(updated) u from blocks where type='d' group by box having u < 20250101000000"
+# 未引用资源（先看清单再清）
+python3 scripts/siyuan.py asset unused
+```
+
+要点：`tag` 列只对块级标签生效；`updated` 是 `yyyyMMddHHmmss` 字符串，比较比大小即可。
+
+### 16.5 文档查重与命名规范
+
+```bash
+python3 scripts/siyuan.py search "同一主题" --title "同一主题"
+python3 scripts/siyuan.py sql "select id,hpath from blocks where type='d' and hpath like '/项目/%' and content like '%关键词%'"
+```
+
+要点：标题搜索只匹配文档；内容的 `docId` 是 `root_id`（CLI 已输出 `docId`+`blockId`）。命名建议 `YYYY-MM-DD 主题`，便于 `hpath like` 过滤。
+
+### 16.6 大段中文/代码的传输
+
+```bash
+python3 scripts/siyuan.py append <docId> -f article.md     # 文件
+cat article.md | python3 scripts/siyuan.py create <NB> /notes/x   # stdin
+```
+
+要点：**不要 `curl -d '{...中文...}'`**（乱码/截断），一律走 CLI 或 `--data-binary @file`。图片先 `upload` 再用返回的 `assets/xxx` 引用。
+
+### 16.7 结构化数据 → 数据库
+
+```bash
+# 建库（走内置 MCP，HTTP 没有该端点）
+python3 scripts/siyuan.py av create <docId> 任务表 \
+  --keys '[{"name":"状态","type":"text"},{"name":"截止","type":"date"}]'
+# 加条目（游离行）
+python3 scripts/siyuan.py av add-item <blockId> --content "写文档" --detached
+python3 scripts/siyuan.py av keys <blockId>
+```
+
+要点：`av` 的 `id` 传数据库块 id（CLI 会自动解析真正的 avID）；条目也可绑定已有块（`--block`）。
+
+### 16.8 模板批量落地
+
+```bash
+python3 scripts/siyuan.py template render "会议纪要.md" --id <docId>   # 渲染变量
+python3 scripts/siyuan.py create <NB> "/2026-11-17 周会" -f 渲染结果.md
+```
+
+要点：模板里的 `{{ }}` 会被 `template render` 自动转义（避免被当 Go action）；模板本身用 `.action{...}` 语法。
+
+---
+
+## 17. 什么时候该停下来问人 / 换工具
+
+- 需要**单文档历史回滚** → `mcp history`；`snapshot` 是整库，代价大。
+- 需要**数据库视图/关联/汇总字段** → 内建 MCP 的 `database` 或人工配置。
+- 需要**实时协同**或**精细排版** → 人来做。
+- 需要**事务性批量写** → 拆成幂等小步 + 快照，别无解。
+
+限制完整清单见 `references/limitations.md`。

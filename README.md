@@ -104,16 +104,28 @@ python3 $S search "关键词"
 ping | notebooks | perms {show,set,confirm} | selftest
 search | read | create | append | update | move | tree | daily | recent
 sql | snapshot {list,create,rollback} | tags | retag | upload
+
+# 数据层通用能力（对齐内核内置 MCP 的 29 个工具面）
+outline | backlinks | attr {get,set,batch} | block {kramdown,children,dom,breadcrumb,info,insert,delete}
+export {md,html,docx} | template {ls,get,render,save-as,rm} | file {ls,read,write,mv,cp,rm}
+notebook {open,close,create,rename,icon} | asset {unused,stat,clean} | sync {status,perform}
+bookmark {ls,rename,rm} | system | av {create,view,keys,search,add-item,add-key,rm-item,rm-key}
+mcp <tool> | import | call <endpoint>
 ```
 
-`sql` 仅放行 `SELECT` / `WITH`（只读，避免绕过命令级权限语义）。
+- `sql` 仅放行 `SELECT` / `WITH`（只读，避免绕过命令级权限语义）。
+- `av *` 与 `mcp *` 走内核内置 MCP（HTTP 未开放建库等端点）；`call` 只放行白名单端点（见 `references/siyuan-api.md`）。
+- 破坏性动作（`block delete`、`file rm`、`av rm-*`、`sync perform`、`snapshot rollback`…）需 `--yes` 且要求对应库 `D`。
 
 ## 文档
 
 - [`references/siyuan-markdown.md`](references/siyuan-markdown.md)：思源 Markdown/Kramdown 语法权威速查
   （行级标记、提示块、超级块、IAL、块引用、导出差异、12 条实测易错点），内容基于官方用户指南 + 3.8.2 live 验证。
 - [`references/siyuan-operations.md`](references/siyuan-operations.md)：任务导向配方（建文档、移动、属性、日记、模板、数据库、搜索、快照、导出）。
-- [`references/siyuan-api.md`](references/siyuan-api.md)：端点目录、块类型、SQLite schema、上传/移动/快照的契约与坑。
+- [`references/siyuan-api.md`](references/siyuan-api.md)：端点目录、块类型、SQLite schema、上传/移动/快照的契约与坑、
+  `call` 白名单、`/mcp` 桥与 HTTP 缺口。
+- [`references/limitations.md`](references/limitations.md)：**能力边界与限制**（硬限制、坑与对策、场景可行性速判、
+  反模式清单、部署检查表、与 MCP 的分工）。
 
 官方资料：SiYuan 仓库 `docs/API.zh-CN.md`、`docs/SY-FORMAT.zh-CN.md`、`docs/DOCUMENT-ADDRESSING.zh-CN.md`、
 `docs/DATABASE-SUBITEMS.zh-CN.md`、`docs/TEMPLATE-MANAGER.zh-CN.md`；Docker 镜像自带用户指南 `/opt/siyuan/guide`。

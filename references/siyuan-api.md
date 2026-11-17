@@ -292,3 +292,54 @@ export SIYUAN_API_URL=http://127.0.0.1:16806 SIYUAN_TOKEN=e2e-token-123
 镜像 entrypoint 会 chown 工作区并执行 `/opt/siyuan/kernel`，因此必须显式给 `serve` 子命令；
 容器内无 python，测试脚本在宿主运行；空工作区首启约 3~5 秒，用 `/api/system/bootProgress` 等待。
 镜像内自带官方用户指南：`/opt/siyuan/guide`（四语言 `.sy`），可 `docker cp` 出来做语法参考。
+
+## 10. 本轮（1.2.0）实测新增/修正
+
+| 端点 | 契约 | 备注 |
+| --- | --- | --- |
+| `/api/file/putFile` | multipart：`path`（相对工作区）、`isDir=false`、`file` | 写工作区文件；CLI 手写 multipart，不依赖 requests |
+| `/api/file/readDir` | `{"path":"data/templates"}` | 返回 `[{name,isDir,isSymlink,updated}]` |
+| `/api/file/getFile` | 返回**裸文件内容**（非 JSON 包络） | 失败时才是 `{code,msg}`，CLI 已兼容两种 |
+| `/api/asset/statAsset` | `{"path":"assets/x.png"}`（**不带前导 `/`**，带 `/` 会 code=1） | 返回 `{size,hSize,created,hCreated,updated,hUpdated}` |
+| `/api/export/exportMd` | `{"id"}` → `{"name","zip":"/export/x.md.zip"}` | **落文件**到工作区 `/export/`，不是内容 |
+| `/api/export/exportMdContent` | `{"id"}` → `{"content"}` | 要 Markdown 文本用这个 |
+| `/api/export/exportHTML` | `{"id","pdf":false}`，`pdf` 必填 | 缺 `pdf` 报 `Field [pdf] is required` |
+| `/api/outline/getDocOutline` | `{"id":docId}` | 返回标题树（`nodeType/type/subType/blocks`） |
+| `/api/ref/getBacklink` / `getBacklinkDoc` | `{"id","keyword?","sort?"}` | 无引用时 `data=null`（不是 `[]`） |
+| `/api/block/getBlockDOM|getBlockKramdown|getChildBlocks|getBlockBreadcrumb|getBlockInfo` | `{"id"}` | 块的读接口；DOM 里能取到 `data-av-id` |
+| `/api/attr/batchGetBlockAttrs` | `{"ids":"id1,id2"}`（**逗号字符串**） | 不是数组 |
+| `/api/template/docSaveAsTemplate` | `{"id","name","overwrite"}` | 存到 `data/templates/<name>.md`，返回 `data=null` |
+| `/api/template/renderSprig` | `{"template": "<内容>"}` | 内容里的字面 `{{ }}` 会被当 Go action 解析 → 必须先转义 |
+| `/api/notebook/open|close|rename|setNotebookIcon` | `{"notebook"}`、`{"notebook","name"}`、`{"notebook","icon"}` | 成功 `data=null` |
+| `/api/sync/performSync` | `{}` | 同步未启用时也返回 code 0，需看 `getSyncInfo` 的 `stat` |
+| `/api/bookmark/getBookmark` | `{}` → `[{name,blocks:[...]}]` | 无书签返回 `[]` |
+| `/api/repo/initRepoKey` | `{}` → `{"key": "..."}` | 快照前置；密钥务必备份 |
+| `/api/import/importStdMd` | `{"notebook","localPath","toPath"}` | `localPath` 是**服务器**可见路径 |
+
+**av（数据库）不要在 HTTP 层硬拼**：`/api/av/getAttributeView` 只读、`addAttributeViewKey` 返回 code 0 但不生效；
+创建数据库 HTTP 根本无端点。CLI 的 `av *` 全部走 `/mcp` 的 `database` 工具；`avID ≠ blockID`，
+需从 `getBlockDOM` 的 `data-av-id` 解析（CLI 自动做）。
+
+## 11. 内置 MCP（`/mcp`）与 HTTP 的缺口
+
+- 端点固定 `/mcp`，Streamable HTTP，`Authorization: Token <token>`，仅管理员；只读模式下拒绝 `POST/DELETE` 类工具。
+- 握手：`initialize`（响应用头 `Mcp-Session-Id` 返回会话 id）→ `notifications/initialized` → `tools/call`。
+  响应可能是 `application/json`，也可能是 SSE（`event: message` + `data: {...}`），两者都要解析。
+- 3.8.2 共 **29 个工具**：`asset attr block bookmark dailynote database document export file history
+  http_request image import inbox notebook outline ref repo search skill sql sync system tag template
+  unzip web_fetch web_search workspace`。
+- HTTP 没有、只能走 MCP 的能力：`database.create`、`skill*`（技能管理）、`web_fetch`/`web_search`、
+  `http_request`、`unzip`、`workspace`、`inbox`、`image`（生图）、`history` 的细粒度回滚。
+- CLI 的统一入口：`siyuan.py mcp <tool> --action <act> --arg k=v`（权限按动作名推断 R/W/D，可用 `--perm` 覆盖）。
+
+## 12. `call` 白名单（`siyuan.py call`）
+
+不在白名单的端点直接拒绝（提示看本节），避免 agent 手拼任意端点绕过权限语义。
+
+| 权限 | 端点（节选） |
+| --- | --- |
+| `R` | `system/currentTime|version|getWorkspaces|getConf|bootProgress`、`outline/getDocOutline`、`ref/getBacklink(|Doc)`、`block/getBlockKramdown|getBlockDOM|getChildBlocks|getBlockBreadcrumb|getBlockIndex|getDocsInfo`、`attr/getBlockAttrs`、`export/exportMdContent|exportHTML`、`filetree/getDoc|getPathByID|getHPathByID|listDocTree`、`search/searchAsset|searchRefBlock`、`template/renderSprig`、`history/getHistoryItems|getHistoryDirs`、`repo/getRepoSnapshots|diffRepoSnapshots|openRepoSnapshotFile`、`riff/getRiffDecks|getRiffCards`、`av/getAttributeViewPrimaryKeyValues`、`notebook/lsNotebooks` |
+| `W` | `block/insertBlock|prependBlock|appendBlock|updateBlock|foldBlock`、`attr/setBlockAttrs`、`filetree/createDocWithMd|renameDoc|moveDocsByID`、`file/putFile|renameFile|copyFile`、`export/exportMd|exportSY|exportDocx`、`template/docSaveAsTemplate`、`notebook/createNotebook|renameNotebook|setNotebookIcon`、`tag/renameTag`、`av/addAttributeViewKey|addAttributeViewBlocks`、`asset/uploadCloud`、`riff/createRiffDeck|addRiffCards` |
+| `D`（需 `--yes`） | `block/deleteBlock`、`filetree/removeDoc(s)`、`file/removeFile`、`notebook/removeNotebook`、`tag/removeTag`、`asset/removeUnusedAsset`、`av/removeAttributeViewKey|removeAttributeViewBlocks`、`repo/purgeRepo`、`riff/removeRiffCards`、`history/rollbackDocByCreated` |
+
+需要新端点：先在本机实例实测（空响应 = 3.8.2 没有），再把「端点 → 权限」加进 `CALL_TABLE`。
