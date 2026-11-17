@@ -1,7 +1,7 @@
 ---
 name: siyuan
 description: 操作远程 SiYuan（思源笔记）：搜索、读文档、创建/追加/更新、移动、文档树、日记、快照、标签、图片上传。当用户说「操作 SiYuan / 思源笔记 / 在思源里搜一下 / 写进思源 / 记到思源 / 追加到某篇文档 / 上传图片到思源 / 看最近笔记 / 做个快照 / 回滚快照」时使用。凭据只从环境变量读取（SIYUAN_API_URL / SIYUAN_TOKEN），权限表存于 ~/.config/.siyuan.json 并按实例地址分组；所有笔记本数据操作前必须通过 R/W/D 权限 GUARD，首次同步后必须先引导用户确认权限。
-version: 1.0.0
+version: 1.1.0
 ---
 
 # SiYuan 远程笔记操作 (siyuan)
@@ -124,6 +124,7 @@ python3 $S move <目标笔记本ID> <docId...> [--to-doc <父文档ID>]
 python3 $S tree [notebookId]
 python3 $S daily <notebookId> -c "今天……"
 python3 $S recent [-n 10]
+python3 $S sql "select id,hpath from blocks where type='d' order by updated desc limit 5"
 
 python3 $S snapshot list [--page 1]
 python3 $S snapshot create [--memo "备份说明"]
@@ -140,8 +141,34 @@ python3 $S upload <notebookId> a.png b.jpg  # 需目标库 W
 cat article.md | python3 $S create 2026... /notes/article
 ```
 
-`search` / `read` / `notebooks` / `perms show` / `snapshot list` / `upload` / `tree` 等支持 `--json`。
-所有子命令支持 `-h`。
+`search` / `read` / `notebooks` / `perms show` / `snapshot list` / `upload` / `tree` / `sql` 等支持 `--json`。
+所有子命令支持 `-h`。`sql` 只放行 `SELECT` / `WITH`，写操作必须走专门命令（否则权限语义会被绕过）。
+
+## 写正文：语法速查（完整版见 references/siyuan-markdown.md）
+
+| 想要 | 写法 | 易错点 |
+| --- | --- | --- |
+| 加粗/斜体/删除线 | `**粗**` `*斜*` `~~删~~` | 单个 `~x~` 是**下标** |
+| 高亮/上下标/按键 | `==标记==` `<sup>x</sup>` `<sub>x</sub>` `<kbd>Ctrl</kbd>` | |
+| 行内代码/公式 | `` `code` `` `$E=mc^2$` | |
+| 标签 | `#项目/子标签#` | 层级用 `/`，不是块属性 |
+| 颜色/背景 | `**文本**{: style="color: var(--b3-font-color1);"}` | 裸文本 + IAL 不生效，必须先套标记 |
+| 提示块 | `> [!NOTE] 标题` + `> 内容` | 类型：NOTE/TIP/IMPORTANT/WARNING/CAUTION |
+| 任务 | `- [ ] 待办` / `- [x] 完成` | 导出统一成 `[X]` |
+| 表格 | `\| a \| b \|` + `\| :-- \| :-: \|` | 单元格内换行别用 `<br>` |
+| 代码/脑图/流程图 | ```` ```js ```` / ```` ```mindmap ```` / ```` ```mermaid ```` | |
+| 公式块 | `$$` 单独成行包住 | |
+| 超级块横排/竖排 | `{{{row` / `{{{col`，子块间**空行**分隔，`}}}` 收尾 | 用 `---` 分隔会多出分隔线块 |
+| 嵌入块（动态查询） | `{{SELECT * FROM blocks WHERE ...}}` 独占一行 | |
+| 块引用 | `((块id "锚文本"))`（单引号=动态锚） | `[[` 只搜文档 |
+| 块超链接 | `[文字](siyuan://blocks/<id>?focus=1)` | |
+| 块属性 | 下一行 `{: name="x" alias="a,b" memo="m" custom-k="v"}` | 文档属性要用 `setBlockAttrs`，IAL 里写 `title` 无效 |
+
+**不支持**：脚注 `[^1]`、定义列表（`术语` + `: 定义`）、行内 HTML 样式（只有块级 HTML 生效）。
+
+**读改写要点**：`read` 走 `exportMdContent`，有损（补 `# 标题`、去 IAL、压表格）；需要精确源码用
+`python3 $S sql "..."` 定位块后调 `/api/block/getBlockKramdown`，改写用 `updateBlock` / `appendBlock`，写完回读校验。
+写入后 SQL 索引有数秒延迟，别用「立刻查不到」判定失败。
 
 ## 常用工作流
 
@@ -199,5 +226,7 @@ python3 $S snapshot rollback <id> --yes    # 用户明确同意后再执行
 ## 文件
 
 - `scripts/siyuan.py` — 全部实现（HTTP + 权限 GUARD + 权限表）
-- `references/siyuan-api.md` — 端点、响应包络、反代坑、上传契约
+- `references/siyuan-markdown.md` — **写正文必读**：行级/块级语法、超级块、IAL、调用约定、易错清单
+- `references/siyuan-operations.md` — 任务配方：建文档/移动/属性/日记/模板/搜索/数据库/资源/快照/导出
+- `references/siyuan-api.md` — 端点全量、块类型、SQL schema、上传契约、反代坑、docker 联调
 - `test/smoke.py` — mock 服务端到端自检（`python3 test/smoke.py`）

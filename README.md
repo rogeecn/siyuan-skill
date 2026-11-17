@@ -8,10 +8,13 @@
 
 ```
 siyuan-skill/
-├── SKILL.md                  # skill 入口：触发词、首次流程、权限模型、命令
-├── scripts/siyuan.py         # 全部实现：HTTP 客户端 + GUARD + 权限表 + CLI
-├── references/siyuan-api.md  # 实测端点、响应包络、反代坑、上传契约
-├── test/smoke.py             # mock SiYuan 端到端自检
+├── SKILL.md                        # skill 入口：触发词、首次流程、权限模型、命令、语法速查
+├── scripts/siyuan.py               # 全部实现：HTTP 客户端 + GUARD + 权限表 + CLI
+├── references/
+│   ├── siyuan-markdown.md          # 写正文必读：行级/块级语法、超级块、IAL、易错清单
+│   ├── siyuan-operations.md        # 任务配方：建文档/移动/属性/日记/模板/搜索/数据库/快照/导出
+│   └── siyuan-api.md               # 端点全量、块类型、SQL schema、上传契约、反代坑
+├── test/smoke.py                   # mock SiYuan 端到端自检
 └── README.md
 ```
 
@@ -100,8 +103,20 @@ python3 $S search "关键词"
 ```
 ping | notebooks | perms {show,set,confirm} | selftest
 search | read | create | append | update | move | tree | daily | recent
-snapshot {list,create,rollback} | tags | retag | upload
+sql | snapshot {list,create,rollback} | tags | retag | upload
 ```
+
+`sql` 仅放行 `SELECT` / `WITH`（只读，避免绕过命令级权限语义）。
+
+## 文档
+
+- [`references/siyuan-markdown.md`](references/siyuan-markdown.md)：思源 Markdown/Kramdown 语法权威速查
+  （行级标记、提示块、超级块、IAL、块引用、导出差异、12 条实测易错点），内容基于官方用户指南 + 3.8.2 live 验证。
+- [`references/siyuan-operations.md`](references/siyuan-operations.md)：任务导向配方（建文档、移动、属性、日记、模板、数据库、搜索、快照、导出）。
+- [`references/siyuan-api.md`](references/siyuan-api.md)：端点目录、块类型、SQLite schema、上传/移动/快照的契约与坑。
+
+官方资料：SiYuan 仓库 `docs/API.zh-CN.md`、`docs/SY-FORMAT.zh-CN.md`、`docs/DOCUMENT-ADDRESSING.zh-CN.md`、
+`docs/DATABASE-SUBITEMS.zh-CN.md`、`docs/TEMPLATE-MANAGER.zh-CN.md`；Docker 镜像自带用户指南 `/opt/siyuan/guide`。
 
 完整参数见 `python3 scripts/siyuan.py <cmd> -h` 或 `SKILL.md`。
 

@@ -28,7 +28,7 @@
 
 子命令：
   ping / notebooks / perms {show,set,confirm} / selftest
-  search / read / create / append / update / move / tree / daily / recent
+  search / read / create / append / update / move / tree / daily / recent / sql
   snapshot {list,create,rollback} / tags / retag / upload
 
 S=scripts/siyuan.py; python3 $S <cmd> -h
@@ -414,21 +414,85 @@ class Client:
         )
         return (data or {}).get("files", [])
 
+    def notebook_conf(self, notebook: str) -> dict:
+        data = self.call("/api/notebook/getNotebookConf", {"notebook": notebook})
+        if not isinstance(data, dict):
+            return {}
+        conf = data.get("conf")
+        return conf if isinstance(conf, dict) else data
+
+    def render_sprig(self, template: str) -> str:
+        data = self.call("/api/template/renderSprig", {"template": template})
+        return data if isinstance(data, str) else ""
+
+    def set_block_attrs(self, block_id: str, attrs: dict):
+        return self.call("/api/attr/setBlockAttrs", {"id": block_id, "attrs": attrs})
+
+    def read_workspace_file(self, path: str) -> str:
+        """/api/file/getFile 返回裸文件内容，不是 JSON 包络。"""
+        raw = self._raw(
+            "/api/file/getFile",
+            json.dumps({"path": path}).encode("utf-8"),
+            {
+                "Authorization": f"Token {self.conn.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        text = raw.decode("utf-8", "replace")
+        if text.lstrip().startswith("{"):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(data, dict) and "code" in data:
+                raise SiYuanError(
+                    "读取文件失败 %s: %s" % (path, data.get("msg") or data.get("code"))
+                )
+        return text
+
     def daily_note(self, notebook: str, markdown: str) -> tuple[str, bool]:
-        """该部署 /api/dailynote/* 返回空 body：退化为 createDocWithMd /YYYY-MM-DD。"""
+        """按笔记本 dailyNoteSavePath（Sprig 模板）解析路径，打 custom-dailynote-yyyymmdd 标记。
+
+        该部署 /api/dailynote/* 返回空 body，所以退化为 createDocWithMd + appendBlock。
+        """
         today = datetime.now().astimezone()
         date_str = today.strftime("%Y-%m-%d")
+        compact = today.strftime("%Y%m%d")
+        conf: dict = {}
+        path = f"/{date_str}"
+        try:
+            conf = self.notebook_conf(notebook)
+            tpl = str(conf.get("dailyNoteSavePath") or "").strip()
+            if tpl:
+                rendered = self.render_sprig(tpl).strip()
+                if rendered:
+                    path = rendered if rendered.startswith("/") else "/" + rendered
+        except SiYuanError:
+            conf = {}
         rows = self.sql(
-            "select id from blocks where type='d' and box='%s' and content='%s' limit 1"
-            % (esc(notebook), esc(date_str))
+            "select id from blocks where type='d' and box='%s' and hpath='%s' limit 1"
+            % (esc(notebook), esc(path))
         )
         if rows:
             doc_id = rows[0]["id"]
             self.append_block(doc_id, markdown)
             return doc_id, False
-        doc_id = self.create_doc(
-            notebook, f"/{date_str}", f"# {date_str}\n\n{markdown}"
-        )
+        body = ""
+        tpl_file = str(conf.get("dailyNoteTemplatePath") or "").strip()
+        if tpl_file:
+            try:
+                body = self.read_workspace_file(tpl_file).strip()
+            except SiYuanError:
+                body = ""
+        head = body or f"# {date_str}"
+        doc_id = self.create_doc(notebook, path, head)
+        attrs = {f"custom-dailynote-{compact}": "1"}
+        try:
+            self.set_block_attrs(doc_id, attrs)
+        except SiYuanError:
+            pass
+        if markdown.strip():
+            self.append_block(doc_id, markdown)
         return doc_id, True
 
     # -- 搜索 / 标签 / 快照 --
@@ -1025,6 +1089,33 @@ def cmd_daily(args):
         print(f"✅ {'已创建' if created else '已追加到'}日记 {doc_id}")
 
 
+def cmd_sql(args):
+    client, entry, _ = prepare(args, "sql_query")
+    Guard(client, entry, "sql_query").any_perm("R")
+    stmt = args.stmt.strip().rstrip(";")
+    if not stmt.lstrip().lower().startswith(("select", "with")):
+        raise SiYuanError(
+            "sql 只接受 SELECT / WITH 查询；写操作请用 create/append/update/move"
+        )
+    rows = client.sql(stmt)
+    if args.json:
+        print_json(rows)
+        return
+    if not rows:
+        print("（无结果）")
+        return
+    cols = list(rows[0].keys())
+    print(" | ".join(cols))
+    for r in rows[: args.limit]:
+        print(
+            " | ".join(
+                "" if r.get(c) is None else str(r.get(c)).replace("\n", "⏎") for c in cols
+            )
+        )
+    if len(rows) > args.limit:
+        print(f"…… 共 {len(rows)} 行，仅显示前 {args.limit} 行")
+
+
 def cmd_recent(args):
     client, entry, _ = prepare(args, "get_recently_updated_documents")
     Guard(client, entry, "get_recently_updated_documents").any_perm("R")
@@ -1248,6 +1339,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = cmd("recent", "最近更新的文档（需任一 R）", cmd_recent)
     sp.add_argument("--limit", "-n", type=int, default=10)
+
+    sp = cmd("sql", "只读 SQL 查询（SELECT/WITH，需任一 R）", cmd_sql)
+    sp.add_argument("stmt")
+    sp.add_argument("--limit", "-n", type=int, default=50)
 
     sp = cmd("snapshot", "快照：list（任一 R）/ create（任一 R）/ rollback（所有 D，需 --yes）", cmd_snapshot)
     ssub = sp.add_subparsers(dest="action", required=True)
