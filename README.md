@@ -108,7 +108,7 @@ sql | snapshot {list,create,rollback} | tags | retag | upload
 # 数据层通用能力（对齐内核内置 MCP 的 29 个工具面）
 outline | backlinks | attr {get,set,batch} | block {kramdown,children,dom,breadcrumb,info,insert,delete}
 export {md,html,docx} | template {ls,get,render,save-as,rm} | file {ls,read,write,mv,cp,rm}
-notebook {open,close,create,rename,icon} | asset {unused,stat,clean} | sync {status,perform}
+notebook {open,close,create,rename,icon} | asset {unused,stat,clean,netimg} | sync {status,perform}
 bookmark {ls,rename,rm} | system | av {create,view,keys,search,add-item,add-key,rm-item,rm-key}
 mcp <tool> | import | call <endpoint>
 ```

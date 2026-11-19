@@ -240,6 +240,19 @@ curl -s -X POST "$SIYUAN_API_URL/api/asset/upload" \
 ```
 
 - 返回的 `succMap` 值就是可写进 Markdown 的 `assets/...` 相对路径。
+
+### 网络资源转本地（= 文档菜单「网络图片转换为本地」）
+
+```bash
+python3 scripts/siyuan.py asset netimg <docId|blockId>              # 仅图片（默认）
+python3 scripts/siyuan.py asset netimg <docId> --all                # 图片 + 音频/视频/file://
+python3 scripts/siyuan.py asset netimg <docId> --referer <原网页URL>  # 防盗链站点
+```
+
+- 内核端点：`/api/format/netImg2LocalAssets {id,url?}` / `netAssets2LocalAssets {id}`；`id` 可为文档或块（按子树）。
+- 转换后链接形如 `assets/network-asset-<原名>-<时间戳>-<随机>.<ext>`；**不改写就说明下载失败**（接口仍 `code=0`）。
+- CLI 输出里的 `converted` 是 `network-asset-*` 数量差，即实际成功数。
+- 下载发生在内核进程：需服务端能出网；单文件 >96MB 跳过；`text/html` 响应当网页跳过。
 - 其它文件端点：`/api/file/getFile {path}`、`putFile`、`removeFile`、`renameFile`、`readDir`；
   导出资源：`/api/export/exportResources {paths}`。
 
@@ -321,7 +334,7 @@ curl -s -X POST "$SIYUAN_API_URL/api/repo/checkoutRepo" -d '{"id":"<snapshotId>"
 | 模板 | `siyuan.py template ls|get|render|save-as|rm` |
 | 工作区文件 | `siyuan.py file ls|read|write|mv|cp|rm` |
 | 笔记本管理 | `siyuan.py notebook open|close|create|rename|icon` |
-| 资源 | `siyuan.py asset unused|stat|clean` |
+| 资源 | `siyuan.py asset unused|stat|clean|netimg` |
 | 同步 | `siyuan.py sync status|perform` |
 | 书签 | `siyuan.py bookmark ls|rename|rm` |
 | 系统 | `siyuan.py system` |

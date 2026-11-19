@@ -104,6 +104,7 @@ python3 $S perms confirm                   # 用户明确同意后才执行
 | `block delete` / `av rm-item|rm-key` | 该块所属笔记本 `D`（`block delete` 需 `--yes`） |
 | `file ls|read` / `template ls|get|render` / `asset unused|stat` / `sync status` / `bookmark ls` / `system` | 任一笔记本 `R` |
 | `file write|mv|cp` / `notebook *` / `import` / `asset clean` | 任一笔记本 `W`（`notebook` 针对具体库时要求该库 `W`） |
+| `asset netimg`（网络资源转本地） | 该块所属笔记本 `W`（改写文档链接） |
 | `file rm` / `template rm` / `sync perform` / `bookmark rm` / `asset clean`（实际删除） | 任一笔记本 `D`，且需 `--yes` |
 | `mcp <tool>` / `call <endpoint>` | 按工具/端点映射 R/W/D；D 类需 `--yes`，显式 `--perm` 可覆盖 |
 | `ping` / `notebooks` / `perms` / `selftest` | 审计豁免（发现新库的入口） |
@@ -189,6 +190,7 @@ python3 $S template ls|get|render|save-as|rm  # data/templates（渲染自动转
 python3 $S file ls|read|write|mv|cp|rm <path> # 工作区文件（data/ 等）
 python3 $S notebook open|close|create|rename|icon
 python3 $S asset unused|stat|clean            # 资源统计/清理（clean 需 --yes）
+python3 $S asset netimg <docId|blockId> [--all] [--referer URL]   # 网络图片/资源转本地（W）
 python3 $S sync status [perform --yes]        # 同步状态（perform 为 D）
 python3 $S bookmark ls|rename|rm
 python3 $S system                             # 版本/工作区/当前时间

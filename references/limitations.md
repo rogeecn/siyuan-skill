@@ -28,10 +28,14 @@
 | token 过期/轮换 | 401 | 重新取 token，只更环境变量，不改权限表 |
 | 大文本/中文 | 用 `curl` 内联 JSON 易乱码/截断 | 一律走 CLI（`-c`/`-f`/stdin），UTF-8 编码 |
 | 标题含 `/` | 被当成多级路径，意外建出父文档 | 标题里避开 `/`，或先建父文档再用 `--to-doc` |
-| 图片防盗链 | 微信/知乎图片直接引用会 403 | 先下载到本地 → `upload` → 用返回的 `assets/xxx` 引用 |
+| 图片防盗链 | 微信/知乎图片直接引用会 403 | `asset netimg <id> --referer <原网页>` 让内核带 Referer 下载；失败再手下载 → `upload` |
+| 网络资源转本地**静默失败** | 内核下载失败（403/404/超时/`text/html`）只写服务端日志，接口仍 `code=0`，前端也只弹 toast | 看 CLI 输出的 `converted`（`network-asset-*` 数量差）；`converted` 小于预期就对比 `block kramdown` 里剩下的 `http` 链接 |
+| 转本地需要服务端出网 | 下载在**内核进程**里做，不是浏览器；墙内/受限服务器会大面积失败 | 确认内网可达目标站点；必要时设 `conf.system.networkProxy`（`getConf`/`setConf`） |
+| 转本地的硬上限 | 单文件 >96MB 跳过；`text/html` 响应当网页跳过；串行下载，大文档接口会长时间阻塞 | 大批量分块（按子标题块 id）转，并调大 `SIYUAN_TIMEOUT` |
 | `hpath` vs `path` | `hpath` 是 `/父/子`，`path` 是 `/<id>/<id>.sy`；混用会 404 | 展示用 `hpath`，移动/存储用 `path` |
 | 标签重命名 | 空目标等于删除，本部署不支持删标签 | `retag <旧> <新>`，新标签必填 |
 | 资源清理 | `asset clean` 删的是「未引用」资源，但索引延迟可能导致误判 | 先 `asset unused` 看清单，再 `--yes`；先 `snapshot create` |
+| 转本地产生垃圾资源 | 同图多次转换、转完又改文档，会留未引用 `network-asset-*` | 转完顺手 `asset unused` 看一眼；别在转换后马上 `clean`（索引延迟） |
 | 同步 | 同步未启用时 `sync status` 返回 `not enabled`；`perform` 是 D 级 | 别把 `perform` 当日常命令 |
 | 只读豁免 | `ping`/`notebooks`/`perms` 不审计，会被用来「探测」库 | 这是有意设计，别用它绕权限改数据 |
 

@@ -88,6 +88,8 @@
 | `/api/asset/upload` | multipart，字段名 **`file[]`** | 见 §4 |
 | `/api/export/exportMdContent` | `{id,headingNumber?,preserveTaskMarkers?}` | `{hPath,content}`，有损 |
 | `/api/export/exportResources` | `{paths,name?,merge?}` | 服务端打包导出 |
+| `/api/format/netImg2LocalAssets` | `{id, url?}` | **网络图片转本地**：把图片链接下载成 `assets/network-asset-*` 并改写文档；`url` 只当 Referer 用 |
+| `/api/format/netAssets2LocalAssets` | `{id}` | 同上，但图片/音频/视频/`file://` 一起转 |
 | `/api/convert/pandoc` | `{dir,args}` | 需内核自带 pandoc |
 | `/api/system/version` | `{}` | `"3.8.2"` |
 | `/api/system/bootProgress` | `{}` | 启动进度（容器刚起时轮询） |
@@ -315,6 +317,8 @@ export SIYUAN_API_URL=http://127.0.0.1:16806 SIYUAN_TOKEN=e2e-token-123
 | `/api/bookmark/getBookmark` | `{}` → `[{name,blocks:[...]}]` | 无书签返回 `[]` |
 | `/api/repo/initRepoKey` | `{}` → `{"key": "..."}` | 快照前置；密钥务必备份 |
 | `/api/import/importStdMd` | `{"notebook","localPath","toPath"}` | `localPath` 是**服务器**可见路径 |
+| `/api/format/netImg2LocalAssets` | `{"id":"<docId 或块 id>","url":""}` → `data=null` | 文档菜单「网络图片转换为本地」背后的端点；块 id 也行（按子树处理）。**失败静默**：403/404/超时只进内核日志，仍返回 code 0 |
+| `/api/format/netAssets2LocalAssets` | `{"id"}` → `data=null` | 同上但含 `audio/video` 与 `file://` 本地链接；`onlyImg=true` 的版本不会碰它们 |
 
 **av（数据库）不要在 HTTP 层硬拼**：`/api/av/getAttributeView` 只读、`addAttributeViewKey` 返回 code 0 但不生效；
 创建数据库 HTTP 根本无端点。CLI 的 `av *` 全部走 `/mcp` 的 `database` 工具；`avID ≠ blockID`，
@@ -339,7 +343,7 @@ export SIYUAN_API_URL=http://127.0.0.1:16806 SIYUAN_TOKEN=e2e-token-123
 | 权限 | 端点（节选） |
 | --- | --- |
 | `R` | `system/currentTime|version|getWorkspaces|getConf|bootProgress`、`outline/getDocOutline`、`ref/getBacklink(|Doc)`、`block/getBlockKramdown|getBlockDOM|getChildBlocks|getBlockBreadcrumb|getBlockIndex|getDocsInfo`、`attr/getBlockAttrs`、`export/exportMdContent|exportHTML`、`filetree/getDoc|getPathByID|getHPathByID|listDocTree`、`search/searchAsset|searchRefBlock`、`template/renderSprig`、`history/getHistoryItems|getHistoryDirs`、`repo/getRepoSnapshots|diffRepoSnapshots|openRepoSnapshotFile`、`riff/getRiffDecks|getRiffCards`、`av/getAttributeViewPrimaryKeyValues`、`notebook/lsNotebooks` |
-| `W` | `block/insertBlock|prependBlock|appendBlock|updateBlock|foldBlock`、`attr/setBlockAttrs`、`filetree/createDocWithMd|renameDoc|moveDocsByID`、`file/putFile|renameFile|copyFile`、`export/exportMd|exportSY|exportDocx`、`template/docSaveAsTemplate`、`notebook/createNotebook|renameNotebook|setNotebookIcon`、`tag/renameTag`、`av/addAttributeViewKey|addAttributeViewBlocks`、`asset/uploadCloud`、`riff/createRiffDeck|addRiffCards` |
+| `W` | `block/insertBlock|prependBlock|appendBlock|updateBlock|foldBlock`、`attr/setBlockAttrs`、`filetree/createDocWithMd|renameDoc|moveDocsByID`、`file/putFile|renameFile|copyFile`、`export/exportMd|exportSY|exportDocx`、`template/docSaveAsTemplate`、`notebook/createNotebook|renameNotebook|setNotebookIcon`、`tag/renameTag`、`av/addAttributeViewKey|addAttributeViewBlocks`、`asset/uploadCloud`、`format/netImg2LocalAssets|netAssets2LocalAssets`、`riff/createRiffDeck|addRiffCards` |
 | `D`（需 `--yes`） | `block/deleteBlock`、`filetree/removeDoc(s)`、`file/removeFile`、`notebook/removeNotebook`、`tag/removeTag`、`asset/removeUnusedAsset`、`av/removeAttributeViewKey|removeAttributeViewBlocks`、`repo/purgeRepo`、`riff/removeRiffCards`、`history/rollbackDocByCreated` |
 
 需要新端点：先在本机实例实测（空响应 = 3.8.2 没有），再把「端点 → 权限」加进 `CALL_TABLE`。

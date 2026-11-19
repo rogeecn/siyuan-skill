@@ -30,6 +30,7 @@ STATE = {
     "notebooks": [{"id": "nb1", "name": "工作"}, {"id": "nb2", "name": "敏感"}],
     "empty_upload": False,
     "moved": None,
+    "net_assets": 0,
     "requests": [],
 }
 BOX = {"doc1": "nb1", "doc2": "nb2", "doc3": "nb1", "doc5": "nb4"}
@@ -104,6 +105,14 @@ class Handler(BaseHTTPRequestHandler):
             assert "fromPaths" in payload, "3.8 的 moveDocs 必须用 fromPaths"
             assert "fromIDs" not in payload, "传 fromIDs 会内核 panic"
             STATE["moved"] = payload
+            return self._send(None)
+        if path == "/api/block/getBlockKramdown":
+            return self._send(
+                {"id": json.loads(raw)["id"], "kramdown": "network-asset-" * STATE["net_assets"]}
+            )
+        if path in ("/api/format/netImg2LocalAssets", "/api/format/netAssets2LocalAssets"):
+            assert json.loads(raw)["id"], "netImg2LocalAssets 必须带 id"
+            STATE["net_assets"] += 2
             return self._send(None)
         if path == "/api/asset/upload":
             assert b'name="file[]"' in raw, "multipart 字段名必须是 file[]"
@@ -206,6 +215,12 @@ def main():
     p = run("upload", "nb1", str(img), "--config", cfg, expect=1)
     assert "空 succMap" in p.stderr
     STATE["empty_upload"] = False
+
+    # 9b. 网络资源转本地：converted = network-asset-* 数量差
+    p = run("asset", "netimg", "doc1", "--config", cfg)
+    assert '"converted": 2' in p.stdout, p.stdout
+    p = run("asset", "netimg", "doc2", "--config", cfg, expect=2)  # nb2 只读
+    assert "需要 W" in p.stderr
 
     # 10. 标签/快照/日记等其余端点走通
     run("tags", "--config", cfg)

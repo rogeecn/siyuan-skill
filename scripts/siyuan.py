@@ -1569,11 +1569,44 @@ def cmd_notebook(args):
         resync()
 
 
+def _count_net_assets(client, block_id: str) -> int:
+    """已本地化的网络资源数：内核把下载的资源统一命名 network-asset-*。"""
+    try:
+        kramdown = (client.call("/api/block/getBlockKramdown", {"id": block_id}) or {}).get(
+            "kramdown"
+        )
+    except SiYuanError:
+        return 0
+    return (kramdown or "").count("network-asset-")
+
+
 def cmd_asset(args):
     op = f"asset_{args.action}"
     client, entry, _ = prepare(args, op)
     guard = Guard(client, entry, op)
     a = args.action
+    if a == "netimg":
+        # 网络资源转本地（= 文档菜单「网络图片转换为本地」背后的内核端点）。
+        # 内核静默失败：403/404/超时只进服务端日志，接口照样 code=0，
+        # 所以用 network-asset-* 数量差反推实际转换数。
+        guard.by_block(args.id, ["W"])
+        endpoint = "/api/format/netAssets2LocalAssets" if args.all else "/api/format/netImg2LocalAssets"
+        payload: dict = {"id": args.id}
+        if args.referer and not args.all:
+            # 这个 url 字段内核不比对，只拿来当 Referer，提升防盗链站点成功率
+            payload["url"] = args.referer
+        before = _count_net_assets(client, args.id)
+        client.call(endpoint, payload)
+        after = _count_net_assets(client, args.id)
+        print_json(
+            {
+                "id": args.id,
+                "mode": "all" if args.all else "image",
+                "converted": max(0, after - before),
+                "endpoint": endpoint,
+            }
+        )
+        return
     if a == "unused":
         guard.any_perm("R")
         print_json(client.call("/api/asset/getUnusedAssets"))
@@ -1831,6 +1864,8 @@ CALL_TABLE = {
     "/api/notebook/renameNotebook": "W",
     "/api/notebook/setNotebookIcon": "W",
     "/api/tag/renameTag": "W",
+    "/api/format/netImg2LocalAssets": "W",
+    "/api/format/netAssets2LocalAssets": "W",
     "/api/av/addAttributeViewKey": "W",
     "/api/av/addAttributeViewBlocks": "W",
     "/api/asset/uploadCloud": "W",
@@ -2135,7 +2170,7 @@ def build_parser() -> argparse.ArgumentParser:
     ni.add_argument("icon")
     ni.set_defaults(func=cmd_notebook, action="icon")
 
-    sp = cmd("asset", "资源：unused/stat（R）、clean（D）", cmd_asset)
+    sp = cmd("asset", "资源：unused/stat（R）、clean（D）、netimg（W）", cmd_asset)
     asub2 = sp.add_subparsers(dest="action", required=True)
     au = asub2.add_parser("unused", parents=[common])
     au.set_defaults(func=cmd_asset, action="unused")
@@ -2145,6 +2180,21 @@ def build_parser() -> argparse.ArgumentParser:
     ac = asub2.add_parser("clean", parents=[common])
     ac.add_argument("--yes", "-y", action="store_true")
     ac.set_defaults(func=cmd_asset, action="clean")
+    ani = asub2.add_parser(
+        "netimg", parents=[common], help="网络资源转本地（文档或块 id；默认仅图片）"
+    )
+    ani.add_argument("id", help="文档 id 或块 id（按该块子树处理）")
+    ani.add_argument(
+        "--all",
+        action="store_true",
+        help="连音频/视频/file:// 一起转（走 netAssets2LocalAssets）",
+    )
+    ani.add_argument(
+        "--referer",
+        metavar="URL",
+        help="下载时带上的 Referer（防盗链站点用，如原网页地址）",
+    )
+    ani.set_defaults(func=cmd_asset, action="netimg")
 
     sp = cmd("sync", "数据同步：status（R）/ perform（D，需 --yes）", cmd_sync)
     ssub2 = sp.add_subparsers(dest="action", required=True)
